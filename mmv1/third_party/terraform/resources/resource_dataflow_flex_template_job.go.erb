@@ -32,6 +32,7 @@ func resourceDataflowFlexTemplateJob() *schema.Resource {
 			"container_spec_gcs_path": {
 				Type:     schema.TypeString,
 				Required: true,
+				Description: `Google Cloud Storage location of the flex template to run. (Must be a URL beginning with 'gs://'.)`
 			},
 
 			"name": {
@@ -61,6 +62,30 @@ func resourceDataflowFlexTemplateJob() *schema.Resource {
 				DiffSuppressFunc: resourceDataflowJobLabelDiffSuppress,
 			},
 
+			"zone": {
+				Type:     schema.TypeString,
+				Optional: true,
+				// ForceNew applies to both stream and batch jobs
+				ForceNew:    true,
+				Description: `The zone in which the created job should run. If it is not provided, the provider zone is used.`,
+			},
+
+			"region": {
+				Type:     schema.TypeString,
+				Optional: true,
+				// ForceNew applies to both stream and batch jobs
+				ForceNew:    true,
+				Description: `The region in which the created job should run.`,
+			},
+
+			"max_workers": {
+				Type:     schema.TypeInt,
+				Optional: true,
+				// ForceNew applies to both stream and batch jobs
+				ForceNew:    true,
+				Description: `The number of workers permitted to work on the job. More workers may improve processing speed at additional cost.`,
+			},
+
 			"parameters": {
 				Type:     schema.TypeMap,
 				Optional: true,
@@ -83,7 +108,7 @@ func resourceDataflowFlexTemplateJob() *schema.Resource {
 				Computed: true,
 			},
 
-     "skip_wait_on_job_termination": {
+			"skip_wait_on_job_termination": {
 				Type:        schema.TypeBool,
 				Optional:    true,
 				Default:     false,
