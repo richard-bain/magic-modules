@@ -32,6 +32,7 @@ func resourceDataflowFlexTemplateJob() *schema.Resource {
 			"container_spec_gcs_path": {
 				Type:     schema.TypeString,
 				Required: true,
+				Description: `Google Cloud Storage location of the flex template to run. (Must be a URL beginning with 'gs://'.)`
 			},
 
 			"name": {
@@ -52,6 +53,7 @@ func resourceDataflowFlexTemplateJob() *schema.Resource {
 				Type:         schema.TypeString,
 				ValidateFunc: validation.StringInSlice([]string{"cancel", "drain"}, false),
 				Optional:     true,
+				// The default for resource_dataflow_job is "drain"
 				Default:      "cancel",
 			},
 
@@ -59,6 +61,22 @@ func resourceDataflowFlexTemplateJob() *schema.Resource {
 				Type:             schema.TypeMap,
 				Optional:         true,
 				DiffSuppressFunc: resourceDataflowJobLabelDiffSuppress,
+			},
+
+			"zone": {
+				Type:     schema.TypeString,
+				Optional: true,
+				// ForceNew applies to both stream and batch jobs
+				ForceNew:    true,
+				Description: `The zone in which the created job should run. If it is not provided, the provider zone is used.`,
+			},
+
+			"max_workers": {
+				Type:     schema.TypeInt,
+				Optional: true,
+				// ForceNew applies to both stream and batch jobs
+				ForceNew:    true,
+				Description: `The number of workers permitted to work on the job. More workers may improve processing speed at additional cost.`,
 			},
 
 			"parameters": {
@@ -83,7 +101,62 @@ func resourceDataflowFlexTemplateJob() *schema.Resource {
 				Computed: true,
 			},
 
-     "skip_wait_on_job_termination": {
+			"service_account_email": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				Description: `The Service Account email used to create the job.`,
+			},
+
+			"network": {
+				Type:             schema.TypeString,
+				Optional:         true,
+				DiffSuppressFunc: compareSelfLinkOrResourceName,
+				Description:      `The network to which VMs will be assigned. If it is not provided, "default" will be used.`,
+			},
+
+			"subnetwork": {
+				Type:             schema.TypeString,
+				Optional:         true,
+				DiffSuppressFunc: compareSelfLinkOrResourceName,
+				Description:      `The subnetwork to which VMs will be assigned. Should be of the form "regions/REGION/subnetworks/SUBNETWORK".`,
+			},
+
+			"machine_type": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				Description: `The machine type to use for the job.`,
+			},
+
+			"kms_key_name": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				Description: `The name for the Cloud KMS key for the job. Key format is: projects/PROJECT_ID/locations/LOCATION/keyRings/KEY_RING/cryptoKeys/KEY`,
+			},
+
+			"ip_configuration": {
+				Type:         schema.TypeString,
+				Optional:     true,
+				Description:  `The configuration for VM IPs. Options are "WORKER_IP_PUBLIC" or "WORKER_IP_PRIVATE".`,
+				ValidateFunc: validation.StringInSlice([]string{"WORKER_IP_PUBLIC", "WORKER_IP_PRIVATE", ""}, false),
+			},
+
+			"additional_experiments": {
+				Type:        schema.TypeSet,
+				Optional:    true,
+				Computed:    true,
+				Description: `List of experiments that should be used by the job. An example value is ["enable_stackdriver_agent_metrics"].`,
+				Elem: &schema.Schema{
+					Type: schema.TypeString,
+				},
+			},
+
+			"enable_streaming_engine": {
+				Type:        schema.TypeBool,
+				Optional:    true,
+				Description: `Indicates if the job should use the streaming engine feature.`,
+			},
+
+			"skip_wait_on_job_termination": {
 				Type:        schema.TypeBool,
 				Optional:    true,
 				Default:     false,
@@ -112,6 +185,14 @@ func resourceDataflowFlexTemplateJobCreate(d *schema.ResourceData, meta interfac
 		return err
 	}
 
+	zone, err := getZone(d, config)
+	if err != nil {
+		return err
+	}
+
+	additionalExperiments := convertStringSet(d.Get("additional_experiments").(*schema.Set))
+
+
 	request := dataflow.LaunchFlexTemplateRequest{
 		LaunchParameter: &dataflow.LaunchFlexTemplateParameter{
 			ContainerSpecGcsPath: d.Get("container_spec_gcs_path").(string),
@@ -119,6 +200,16 @@ func resourceDataflowFlexTemplateJobCreate(d *schema.ResourceData, meta interfac
 			Parameters:           expandStringMap(d, "parameters"),
 			Environment: &dataflow.FlexTemplateRuntimeEnvironment{
 				AdditionalUserLabels: expandStringMap(d, "labels"),
+				EnableStreamingEngine: d.Get("enable_streaming_engine").(string),
+				IpConfiguration: d.Get("ip_configuration").(string),
+				KmsKeyName: d.Get("kms_key_name").(string),
+				MachineType: (d, "machine_type"),
+				MaxWorkers: int64(d.Get("max_workers").(int)),
+				Network: d.Get("network").(string)
+				Subnetwork: d.Get("subnetwork").(string),
+				TempLocation: d.Get("temp_gcs_location").(string),
+				WorkerZone: zone,
+				AdditionalExperiments: additionalExperiments,
 			},
 		},
 	}
@@ -168,7 +259,9 @@ func resourceDataflowFlexTemplateJobRead(d *schema.ResourceData, meta interface{
 	if err != nil {
 		return handleNotFoundError(err, d, fmt.Sprintf("Dataflow job %s", jobId))
 	}
-
+	if err := d.Set("job_id", job.Id); err != nil {
+		return fmt.Errorf("Error setting job_id: %s", err)
+	}
 	if err := d.Set("state", job.CurrentState); err != nil {
 		return fmt.Errorf("Error setting state: %s", err)
 	}
@@ -181,6 +274,32 @@ func resourceDataflowFlexTemplateJobRead(d *schema.ResourceData, meta interface{
 	if err := d.Set("labels", job.Labels); err != nil {
 		return fmt.Errorf("Error setting labels: %s", err)
 	}
+
+	if err := d.Set("kms_key_name", job.Environment.ServiceKmsKeyName); err != nil {
+		return fmt.Errorf("Error setting kms_key_name: %s", err)
+	}
+
+	sdkPipelineOptions, err := ConvertToMap(job.Environment.SdkPipelineOptions)
+	if err != nil {
+		return err
+	}
+	optionsMap := sdkPipelineOptions["options"].(map[string]interface{})
+	if err := d.Set("template_gcs_path", optionsMap["templateLocation"]); err != nil {
+		return fmt.Errorf("Error setting template_gcs_path: %s", err)
+	}
+	if err := d.Set("temp_gcs_location", optionsMap["tempLocation"]); err != nil {
+		return fmt.Errorf("Error setting temp_gcs_location: %s", err)
+	}
+	if err := d.Set("machine_type", optionsMap["machineType"]); err != nil {
+		return fmt.Errorf("Error setting machine_type: %s", err)
+	}
+	if err := d.Set("network", optionsMap["network"]); err != nil {
+		return fmt.Errorf("Error setting network: %s", err)
+	}
+	if err := d.Set("service_account_email", optionsMap["serviceAccountEmail"]); err != nil {
+		return fmt.Errorf("Error setting service_account_email: %s", err)
+	}
+
 
   if ok := shouldStopDataflowJobDeleteQuery(job.CurrentState, d.Get("skip_wait_on_job_termination").(bool)); ok {
 		log.Printf("[DEBUG] Removing resource '%s' because it is in state %s.\n", job.Name, job.CurrentState)
@@ -252,6 +371,13 @@ func resourceDataflowFlexTemplateJobUpdate(d *schema.ResourceData, meta interfac
 		return err
 	}
 
+	zone, err := getZone(d, config)
+	if err != nil {
+		return err
+	}
+
+	additionalExperiments := convertStringSet(d.Get("additional_experiments").(*schema.Set))
+
 	// wait until current job is running or terminated
 	err = waitForDataflowJobState(d, config, d.Id(), userAgent, d.Timeout(schema.TimeoutUpdate), "JOB_STATE_RUNNING")
 	if err != nil {
@@ -265,6 +391,16 @@ func resourceDataflowFlexTemplateJobUpdate(d *schema.ResourceData, meta interfac
 			Parameters:           expandStringMap(d, "parameters"),
 			Environment: &dataflow.FlexTemplateRuntimeEnvironment{
 				AdditionalUserLabels: expandStringMap(d, "labels"),
+				EnableStreamingEngine: d.Get("enable_streaming_engine").(string),
+				IpConfiguration: d.Get("ip_configuration").(string),
+				KmsKeyName: d.Get("kms_key_name").(string),
+				MachineType: (d, "machine_type"),
+				MaxWorkers: int64(d.Get("max_workers").(int)),
+				Network: d.Get("network").(string)
+				Subnetwork: d.Get("subnetwork").(string),
+				TempLocation: d.Get("temp_gcs_location").(string),
+				WorkerZone: zone,
+				AdditionalExperiments: additionalExperiments,
 			},
 			Update:               true,
 		},
